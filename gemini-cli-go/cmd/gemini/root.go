@@ -1,17 +1,20 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/whezingoak/gemini-cli-go/pkg/api"
 	"github.com/whezingoak/gemini-cli-go/pkg/commands"
 	"github.com/whezingoak/gemini-cli-go/pkg/config"
 	"github.com/whezingoak/gemini-cli-go/pkg/terminal"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "gemini",
+	Use:   "gemini [prompt]",
 	Short: "Gemini CLI - Interact with Google's Gemini models",
 	Long:  `Gemini CLI is a tool to interact with Google's Gemini models directly from your terminal.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
@@ -21,6 +24,29 @@ var rootCmd = &cobra.Command{
 		// Apply theme (could be loaded from config later)
 		terminal.ApplyTheme(terminal.DefaultDark)
 		return nil
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background()
+		client, err := api.NewClient(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
+
+		if len(args) == 0 {
+			// Interactive Chat Mode
+			return terminal.StartChat(client)
+		} else {
+			// One-off Prompt Mode
+			prompt := strings.Join(args, " ")
+			resp, err := client.GenerateContent(ctx, prompt)
+			if err != nil {
+				return err
+			}
+			if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+				fmt.Println(resp.Candidates[0].Content.Parts[0].Text)
+			}
+			return nil
+		}
 	},
 }
 

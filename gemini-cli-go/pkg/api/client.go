@@ -80,6 +80,18 @@ func (c *Client) StartChat() *ChatSession {
 	}
 }
 
+func (s *ChatSession) AddContext(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.History = append(s.History, Content{
+		Role: "user",
+		Parts: []Part{
+			{Text: text},
+		},
+	})
+}
+
 func (s *ChatSession) SendMessage(ctx context.Context, message string) (*GenerateContentResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,6 +153,92 @@ func (s *ChatSession) SendMessage(ctx context.Context, message string) (*Generat
 	}
 
 	return &apiResp, nil
+}
+
+// SendMessageStream sends a message and streams the response via callback
+func (s *ChatSession) SendMessageStream(ctx context.Context, message string, onChunk func(string)) (*GenerateContentResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Append user message to history
+	userContent := Content{
+		Role: "user",
+		Parts: []Part{
+			{Text: message},
+		},
+	}
+	s.History = append(s.History, userContent)
+
+	url := fmt.Sprintf("%s/models/%s:streamGenerateContent", BaseURL, s.client.Model)
+
+	reqBody := GenerateContentRequest{
+		Contents: s.History,
+		GenerationConfig: GenerationConfig{
+			Temperature:     config.Get().Temperature,
+			MaxOutputTokens: config.Get().MaxOutputTokens,
+		},
+	}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	dec := json.NewDecoder(resp.Body)
+
+	// Expect start of array
+	t, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read JSON token: %w", err)
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '[' {
+		// It might be a single object error if something went wrong but status was 200 (unlikely)
+		return nil, fmt.Errorf("expected JSON array start, got %v", t)
+	}
+
+	var fullText string
+	for dec.More() {
+		var chunk GenerateContentResponse
+		if err := dec.Decode(&chunk); err != nil {
+			return nil, fmt.Errorf("failed to decode chunk: %w", err)
+		}
+		if len(chunk.Candidates) > 0 && len(chunk.Candidates[0].Content.Parts) > 0 {
+			text := chunk.Candidates[0].Content.Parts[0].Text
+			fullText += text
+			if onChunk != nil {
+				onChunk(text)
+			}
+		}
+	}
+
+	// Consume end of array
+	_, _ = dec.Token()
+
+	// Append full model response to history
+	modelContent := Content{
+		Role: "model",
+		Parts: []Part{{Text: fullText}},
+	}
+	s.History = append(s.History, modelContent)
+
+	return &GenerateContentResponse{Candidates: []Candidate{{Content: modelContent}}}, nil
 }
 
 // Keep GenerateContent for single-turn requests if needed

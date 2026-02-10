@@ -3,6 +3,7 @@ package terminal
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -14,16 +15,22 @@ import (
 )
 
 type ChatModel struct {
-	viewport    viewport.Model
-	textarea    textarea.Model
-	session     *api.ChatSession
-	messages    []string
-	err         error
-	width, height int
+	viewport        viewport.Model
+	textarea        textarea.Model
+	session         *api.ChatSession
+	messages        []string // Rendered HTML/ANSI messages
+	err             error
+	width, height   int
+
+	// Streaming state
+	streaming       bool
+	currentResponse string
+	sub             chan string // Channel for receiving chunks
 }
 
 type errMsg error
-type responseMsg string
+type chunkMsg string
+type streamDoneMsg struct{}
 
 func StartChat(client *api.Client) error {
 	p := tea.NewProgram(initialModel(client))
@@ -35,6 +42,12 @@ func StartChat(client *api.Client) error {
 
 func initialModel(client *api.Client) ChatModel {
 	session := client.StartChat()
+
+	// Load GEMINI.md if it exists
+	if content, err := os.ReadFile("GEMINI.md"); err == nil {
+		session.AddContext(fmt.Sprintf("Project Context (GEMINI.md):\n%s", string(content)))
+	}
+
 	ta := textarea.New()
 	ta.Placeholder = "Send a message..."
 	ta.Focus()
@@ -84,42 +97,63 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// Handle commands
+			if strings.HasPrefix(v, "/") {
+				return m.handleCommand(v)
+			}
+
+			if m.streaming {
+				return m, nil // Ignore input while streaming
+			}
+
 			userMsg := fmt.Sprintf("**You:** %s", v)
 			renderedUserMsg, _ := renderMarkdown(userMsg, m.viewport.Width)
 			m.messages = append(m.messages, renderedUserMsg)
-
 			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+
 			m.textarea.Reset()
 			m.viewport.GotoBottom()
 
-			// Send to API
-			return m, func() tea.Msg {
-				resp, err := m.session.SendMessage(context.Background(), v)
-				if err != nil {
-					return errMsg(err)
-				}
-				if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
-					return responseMsg(resp.Candidates[0].Content.Parts[0].Text)
-				}
-				return errMsg(fmt.Errorf("no response content"))
-			}
+			m.streaming = true
+			m.currentResponse = ""
+			m.sub = make(chan string)
+
+			return m, tea.Batch(
+				startStreaming(m.session, v, m.sub),
+				waitForChunk(m.sub),
+			)
 		}
 
-	// We handle errors just like any other message
 	case errMsg:
 		m.err = msg
+		m.streaming = false
 		errorMsg := fmt.Sprintf("**Error:** %s", msg.Error())
 		renderedError, _ := renderMarkdown(errorMsg, m.viewport.Width)
 		m.messages = append(m.messages, renderedError)
 		m.viewport.SetContent(strings.Join(m.messages, "\n"))
 		return m, nil
 
-	case responseMsg:
-		geminiMsg := fmt.Sprintf("**Gemini:**\n%s", string(msg))
-		renderedGemini, _ := renderMarkdown(geminiMsg, m.viewport.Width)
-		m.messages = append(m.messages, renderedGemini)
+	case chunkMsg:
+		m.currentResponse += string(msg)
+
+		geminiMsg := fmt.Sprintf("**Gemini:**\n%s", m.currentResponse)
+		rendered, _ := renderMarkdown(geminiMsg, m.viewport.Width)
+
+		fullContent := strings.Join(m.messages, "\n") + "\n" + rendered
+		m.viewport.SetContent(fullContent)
+		m.viewport.GotoBottom()
+
+		return m, waitForChunk(m.sub)
+
+	case streamDoneMsg:
+		m.streaming = false
+		// Finalize
+		geminiMsg := fmt.Sprintf("**Gemini:**\n%s", m.currentResponse)
+		rendered, _ := renderMarkdown(geminiMsg, m.viewport.Width)
+		m.messages = append(m.messages, rendered)
 		m.viewport.SetContent(strings.Join(m.messages, "\n"))
 		m.viewport.GotoBottom()
+		m.currentResponse = "" // Clear current response
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -136,6 +170,96 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(tiCmd, vpCmd)
+}
+
+func startStreaming(session *api.ChatSession, prompt string, sub chan string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := session.SendMessageStream(context.Background(), prompt, func(chunk string) {
+			sub <- chunk
+		})
+		if err != nil {
+			return errMsg(err)
+		}
+		close(sub)
+		return nil
+	}
+}
+
+func waitForChunk(sub chan string) tea.Cmd {
+	return func() tea.Msg {
+		chunk, ok := <-sub
+		if !ok {
+			return streamDoneMsg{}
+		}
+		return chunkMsg(chunk)
+	}
+}
+
+func (m ChatModel) handleCommand(cmd string) (ChatModel, tea.Cmd) {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return m, nil
+	}
+
+	switch parts[0] {
+	case "/clear":
+		m.messages = []string{}
+		m.viewport.SetContent("Chat cleared.")
+		m.textarea.Reset()
+		return m, nil
+	case "/exit", "/quit":
+		return m, tea.Quit
+	case "/help":
+		helpMsg, _ := renderMarkdown(`
+**Available Commands:**
+- **/add <file>**: Add file content to chat context
+- **/clear**: Clear chat history
+- **/exit**: Exit chat
+- **/help**: Show this help message
+`, m.viewport.Width)
+		m.messages = append(m.messages, helpMsg)
+		m.viewport.SetContent(strings.Join(m.messages, "\n"))
+		m.textarea.Reset()
+		return m, nil
+	case "/add":
+		if len(parts) < 2 {
+			errMsg := "**Error:** Usage: `/add <file>`"
+			rendered, _ := renderMarkdown(errMsg, m.viewport.Width)
+			m.messages = append(m.messages, rendered)
+			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+
+		filepath := parts[1]
+		content, err := os.ReadFile(filepath)
+		if err != nil {
+			errMsg := fmt.Sprintf("**Error:** Failed to read file `%s`: %s", filepath, err)
+			rendered, _ := renderMarkdown(errMsg, m.viewport.Width)
+			m.messages = append(m.messages, rendered)
+			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+
+		// Add to context
+		m.session.AddContext(fmt.Sprintf("File: %s\nContent:\n```\n%s\n```", filepath, string(content)))
+
+		successMsg := fmt.Sprintf("**System:** Added `%s` to context.", filepath)
+		rendered, _ := renderMarkdown(successMsg, m.viewport.Width)
+		m.messages = append(m.messages, rendered)
+		m.viewport.SetContent(strings.Join(m.messages, "\n"))
+		m.textarea.Reset()
+		return m, nil
+
+	default:
+		errMsg := fmt.Sprintf("**Error:** Unknown command `%s`", parts[0])
+		rendered, _ := renderMarkdown(errMsg, m.viewport.Width)
+		m.messages = append(m.messages, rendered)
+		m.viewport.SetContent(strings.Join(m.messages, "\n"))
+		m.textarea.Reset()
+		return m, nil
+	}
 }
 
 func (m ChatModel) headerView() string {
